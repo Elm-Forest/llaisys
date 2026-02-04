@@ -14,13 +14,11 @@ class Qwen2:
     def __init__(self, model_path, device: DeviceType = DeviceType.CPU):
         self.model_path = Path(model_path)
         self.device = device
-        # 保存 Tensor 引用防止被 Python GC 回收，导致 C++ 指针悬空
         self._tensor_refs = []
 
         # 1. 加载 Config
         config_path = self.model_path / "config.json"
         if not config_path.exists():
-             # 尝试递归查找
             candidates = list(self.model_path.rglob("config.json"))
             if candidates:
                 config_path = candidates[0]
@@ -31,7 +29,6 @@ class Qwen2:
             config = json.load(f)
 
         # 2. 准备 Meta
-        # 注意：我们将所有权重在 Python 端转换为 F32，所以告诉 C++ 我们使用的是 F32
         self.meta = LlaisysQwen2Meta()
         self.meta.dtype = DataType.F32 
         self.meta.nlayer = int(config["num_hidden_layers"])
@@ -60,7 +57,7 @@ class Qwen2:
         # 4. 获取权重指针结构体
         self.weights_struct = LIB_LLAISYS.llaisysQwen2ModelWeights(self.handle).contents
 
-        # 5. 加载权重 (使用手动解析 header + mmap 方式)
+        # 5. 加载权重
         self._load_weights()
 
     def _load_weights(self):
@@ -77,24 +74,17 @@ class Qwen2:
             self._load_safetensors_file(file)
 
     def _load_safetensors_file(self, file_path: Path):
-        """
-        手动解析 safetensors 文件，绕过 numpy 对 bfloat16 的限制。
-        """
         with open(file_path, "rb") as f:
-            # 1. 读取头部长度 (8字节 uint64)
             header_size_bytes = f.read(8)
             if len(header_size_bytes) != 8:
                 return
             header_size = struct.unpack("<Q", header_size_bytes)[0]
             
-            # 2. 读取并解析头部 JSON
             header_json = f.read(header_size).decode("utf-8")
             header = json.loads(header_json)
             
-            # 数据区开始的绝对偏移量
             data_start = 8 + header_size
 
-            # 3. 使用 mmap 映射文件数据区
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 for name, info in header.items():
                     if name == "__metadata__":
@@ -104,63 +94,44 @@ class Qwen2:
                     shape = info["shape"]
                     offsets = info["data_offsets"]
                     
-                    # 获取原始字节
                     start = data_start + offsets[0]
                     end = data_start + offsets[1]
                     raw_bytes = mm[start:end]
 
-                    # 4. 关键：将数据转换为 Float32 Numpy Array
-                    # 无论原始是 F16 还是 BF16，我们都转为 F32 传给 C++
-                    # 这样避免了依赖特定 numpy 版本或 torch
                     np_data = self._convert_to_f32(raw_bytes, dtype_str)
                     
                     if np_data is not None:
                         self._dispatch_weight(name, np_data, shape)
 
     def _convert_to_f32(self, raw_bytes: bytes, dtype_str: str) -> np.ndarray:
-        """
-        将原始字节转换为 float32 数组。
-        处理 BF16 的黑魔法就在这里。
-        """
         if dtype_str == "BF16":
-            # 读取为 uint16
             raw_u16 = np.frombuffer(raw_bytes, dtype=np.uint16)
-            # 核心技巧：BF16 是 FP32 的高16位。
-            # 将 uint16 转为 uint32，左移 16 位，然后 view 为 float32
-            # [BF16_bits] -> [BF16_bits | 0000000000000000] (in FP32 format)
             arr_f32 = (raw_u16.astype(np.uint32) << 16).view(np.float32)
             return arr_f32
-        
         elif dtype_str == "F16":
-            # 标准 F16，numpy 通常支持读取，然后转为 F32
             return np.frombuffer(raw_bytes, dtype=np.float16).astype(np.float32)
-        
         elif dtype_str == "F32":
             return np.frombuffer(raw_bytes, dtype=np.float32)
-        
         return None
 
     def _dispatch_weight(self, name: str, data: np.ndarray, shape: List[int]):
-        """
-        将转换好的 F32 数据加载到 C++ 对应的 Tensor 中。
-        """
-        # 辅助：创建 Tensor 并加载数据
+        # 辅助：加载到 C 指针
         def load_to_ptr(c_tensor_ptr):
             if not c_tensor_ptr:
-                return # C++ 端没有初始化这个层（例如 layer index 超出）
+                return
             
-            # 使用 libllaisys.tensor 的 Tensor 类包装 C 指针
-            # 注意：我们这里不需要 create 新 tensor，因为 C++ 已经在 ModelCreate 时分配了内存
-            # 我们只需要把数据 memcpy 进去。
-            
-            # 获取目标 Tensor 的封装
+            # 1. 创建临时的 Python Tensor 对象来包装 C 指针
             t = Tensor(tensor=c_tensor_ptr)
             
-            # 检查形状是否匹配（可选，但推荐）
-            # if t.shape != shape: print(f"Shape mismatch {name}")
-            
-            # 加载数据
+            # 2. 调用 C API 加载数据
             t.load(data.ctypes.data)
+
+            # [关键修复]：解除 Python 对象对 C Handle 的所有权
+            # 这里的 c_tensor_ptr 是属于 C++ Model 的，不能被 Python 销毁。
+            # 我们将 Python 对象内部的 handle 设为 None，这样 t.__del__() 就不会释放它了。
+            for attr in ["_handle", "_tensor", "_impl", "handle"]:
+                if hasattr(t, attr):
+                    setattr(t, attr, None)
 
         # 权重映射逻辑
         if name == "model.embed_tokens.weight":
