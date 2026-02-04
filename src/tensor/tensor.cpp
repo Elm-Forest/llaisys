@@ -168,8 +168,11 @@ bool Tensor::isContiguous() const {
     size_t ndim_ = this->ndim();
     const auto &shape_ = this->shape();
     const auto &strides_ = this->strides();
-    for (int i = ndim_ - 1; i >= 0; --i) {
-        if (strides_[i] != accumulated_stride) {
+    
+    // 使用 int i 防止 size_t 在 i-- 时的下溢风险
+    for (int i = static_cast<int>(ndim_) - 1; i >= 0; --i) {
+        // 【修复】将 size_t 类型的 accumulated_stride 转换为 ptrdiff_t 以匹配 strides_ 的类型
+        if (strides_[i] != static_cast<ptrdiff_t>(accumulated_stride)) {
             return false;
         }
         accumulated_stride *= shape_[i];
