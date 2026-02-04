@@ -169,9 +169,7 @@ bool Tensor::isContiguous() const {
     const auto &shape_ = this->shape();
     const auto &strides_ = this->strides();
     
-    // 使用 int i 防止 size_t 在 i-- 时的下溢风险
     for (int i = static_cast<int>(ndim_) - 1; i >= 0; --i) {
-        // 【修复】将 size_t 类型的 accumulated_stride 转换为 ptrdiff_t 以匹配 strides_ 的类型
         if (strides_[i] != static_cast<ptrdiff_t>(accumulated_stride)) {
             return false;
         }
@@ -180,10 +178,6 @@ bool Tensor::isContiguous() const {
     return true;
 }
 tensor_t Tensor::permute(const std::vector<size_t> &order) const {
-    if (order.size() != this->ndim()) {
-        throw std::runtime_error("Permute order size mismatch.");
-    }
-
     std::vector<size_t> new_shape(order.size());
     std::vector<ptrdiff_t> new_strides(order.size());
 
@@ -198,15 +192,15 @@ tensor_t Tensor::permute(const std::vector<size_t> &order) const {
 tensor_t Tensor::view(const std::vector<size_t> &shape) const {
     size_t new_numel = std::accumulate(shape.begin(), shape.end(), size_t(1), std::multiplies<size_t>());
     if (new_numel != this->numel()) {
-        throw std::runtime_error("View shape incompatible with tensor size.");
+        throw std::runtime_error("View shape错误");
     }
     if (!this->isContiguous()) {
-        throw std::runtime_error("View on non-contiguous tensor is not supported.");
+        throw std::runtime_error("View不连续");
     }
 
     std::vector<ptrdiff_t> new_strides(shape.size());
     size_t stride = 1;
-    for (size_t i = shape.size() - 1; i >= 0; --i) {
+    for (int i = static_cast<int>(shape.size()) - 1; i >= 0; --i) {
         new_strides[i] = stride;
         stride *= shape[i];
     }
@@ -216,9 +210,6 @@ tensor_t Tensor::view(const std::vector<size_t> &shape) const {
 }
 
 tensor_t Tensor::slice(size_t dim, size_t start, size_t end) const {
-    if (dim >= this->ndim()) throw std::out_of_range("Slice dim out of range");
-    if (start >= end || end > this->shape()[dim]) throw std::out_of_range("Invalid slice indices");
-
     std::vector<size_t> new_shape = this->shape();
     new_shape[dim] = end - start;
     
