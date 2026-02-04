@@ -95,18 +95,20 @@ target("llaisys-ops")
     on_install(function (target) end)
 target_end()
 
+-- [修复关键点 1] 添加 llaisys-models 目标
 target("llaisys-models")
     set_kind("static")
     add_deps("llaisys-tensor")
-    add_deps("llaisys-ops")  -- 模型依赖算子
+    add_deps("llaisys-ops")
 
     set_languages("cxx17")
     set_warnings("all", "error")
     if not is_plat("windows") then
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
-
-    add_files("src/models/*/*.cpp") -- 编译 src/models 下的所有 cpp
+    
+    -- 编译所有模型代码
+    add_files("src/models/*/*.cpp")
 
     on_install(function (target) end)
 target_end()
@@ -118,14 +120,18 @@ target("llaisys")
     add_deps("llaisys-core")
     add_deps("llaisys-tensor")
     add_deps("llaisys-ops")
-    add_deps("llaisys-models")
+    -- [修复关键点 2] 添加对 models 的依赖
+    add_deps("llaisys-models") 
 
     set_languages("cxx17")
     set_warnings("all", "error")
+    
     add_files("src/llaisys/*.cc")
+    -- [修复关键点 3] 确保编译模型的 C API 接口文件
+    add_files("src/llaisys/models/*.cc")
+
     set_installdir(".")
 
-    
     after_install(function (target)
         -- copy shared library to python package
         print("Copying llaisys to python/llaisys/libllaisys/ ..")
