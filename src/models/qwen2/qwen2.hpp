@@ -3,6 +3,7 @@
 #include "llaisys/models/qwen2.h"
 #include "../../tensor/tensor.hpp"
 #include <vector>
+#include <random>
 
 namespace llaisys::models::qwen2 {
 
@@ -13,6 +14,8 @@ public:
 
     LlaisysQwen2Weights *weights();
     int64_t infer(int64_t *token_ids, size_t ntoken);
+    int64_t infer_with_sampling(int64_t *token_ids, size_t ntoken, const LlaisysSamplingConfig *sampling);
+    void reset();
 
 private:
     LlaisysQwen2Meta _meta;
@@ -45,9 +48,11 @@ private:
     std::vector<tensor_t> _v_cache;
 
     int64_t _current_pos;
+    std::mt19937_64 _rng;
 
     // 辅助函数：创建并初始化权重张量
     tensor_t create_weight(const std::vector<size_t>& shape);
+    int64_t sample_from_logits(const std::vector<float> &logits, const LlaisysSamplingConfig *sampling);
 };
 
 } // namespace llaisys::models::qwen2

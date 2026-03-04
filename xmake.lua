@@ -45,6 +45,9 @@ target("llaisys-device")
     end
 
     add_files("src/device/*.cpp")
+    if has_config("nv-gpu") then
+        add_deps("llaisys-device-nvidia")
+    end
 
     on_install(function (target) end)
 target_end()
@@ -127,8 +130,6 @@ target("llaisys")
     set_warnings("all", "error")
     
     add_files("src/llaisys/*.cc")
-    -- [修复关键点 3] 确保编译模型的 C API 接口文件
-    add_files("src/llaisys/models/*.cc")
 
     set_installdir(".")
 

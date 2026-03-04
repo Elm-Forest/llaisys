@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Sequence, List, Dict, Any
 
 from ..libllaisys import LIB_LLAISYS, DeviceType, DataType
-from ..libllaisys.models import LlaisysQwen2Meta, LlaisysQwen2Weights
+from ..libllaisys.models import LlaisysQwen2Meta, LlaisysQwen2Weights, LlaisysSamplingConfig
 from ..tensor import Tensor
 
 class Qwen2:
@@ -197,12 +197,19 @@ class Qwen2:
         if max_new_tokens is None:
             max_new_tokens = 128
 
+        self.reset_cache()
         generated = list(inputs)
         curr_len = len(generated)
+        sampling = LlaisysSamplingConfig(
+            temperature=float(temperature),
+            top_k=int(top_k),
+            top_p=float(top_p),
+            seed=0,
+        )
         
         # 1. Prefill
         in_arr = (ctypes.c_int64 * curr_len)(*generated)
-        next_token = LIB_LLAISYS.llaisysQwen2ModelInfer(self.handle, in_arr, curr_len)
+        next_token = LIB_LLAISYS.llaisysQwen2ModelInferEx(self.handle, in_arr, curr_len, ctypes.byref(sampling))
         generated.append(next_token)
         
         # 2. Decode
@@ -211,7 +218,22 @@ class Qwen2:
                 break
                 
             in_arr = (ctypes.c_int64 * 1)(next_token)
-            next_token = LIB_LLAISYS.llaisysQwen2ModelInfer(self.handle, in_arr, 1)
+            next_token = LIB_LLAISYS.llaisysQwen2ModelInferEx(self.handle, in_arr, 1, ctypes.byref(sampling))
             generated.append(next_token)
             
         return generated
+
+    def generate_stream(
+        self,
+        inputs: Sequence[int],
+        max_new_tokens: int = 128,
+        top_k: int = 40,
+        top_p: float = 0.95,
+        temperature: float = 0.8,
+    ):
+        output = self.generate(inputs, max_new_tokens=max_new_tokens, top_k=top_k, top_p=top_p, temperature=temperature)
+        for token in output[len(inputs):]:
+            yield token
+
+    def reset_cache(self):
+        LIB_LLAISYS.llaisysQwen2ModelReset(self.handle)

@@ -5,6 +5,8 @@
 #include <cmath>
 #include <iostream>
 #include <vector>
+#include <algorithm>
+#include <limits>
 
 // 引入算子
 #include "../../ops/add/op.hpp"
@@ -24,7 +26,7 @@ llaisysTensor_t wrap(tensor_t t) {
 }
 
 Qwen2Model::Qwen2Model(const LlaisysQwen2Meta &meta, llaisysDeviceType_t device_type, int device_id)
-    : _meta(meta), _device_type(device_type), _device_id(device_id), _current_pos(0) {
+    : _meta(meta), _device_type(device_type), _device_id(device_id), _current_pos(0), _rng(0xC0D3) {
     
     // 设置上下文设备
     core::context().setDevice(device_type, device_id);
@@ -140,6 +142,72 @@ LlaisysQwen2Weights *Qwen2Model::weights() {
     return &_weights_export;
 }
 
+void Qwen2Model::reset() {
+    _current_pos = 0;
+}
+
+int64_t Qwen2Model::sample_from_logits(const std::vector<float> &logits, const LlaisysSamplingConfig *sampling) {
+    if (sampling == nullptr || sampling->temperature <= 0.0f ||
+        (sampling->top_k <= 1 && sampling->top_p <= 0.0f)) {
+        size_t best_idx = 0;
+        for (size_t i = 1; i < logits.size(); ++i) {
+            if (logits[i] > logits[best_idx]) best_idx = i;
+        }
+        return static_cast<int64_t>(best_idx);
+    }
+
+    if (sampling->seed != 0) {
+        _rng.seed(sampling->seed);
+    }
+
+    std::vector<std::pair<float, int64_t>> scored;
+    scored.reserve(logits.size());
+    const float inv_temp = 1.0f / std::max(1e-5f, sampling->temperature);
+    for (size_t i = 0; i < logits.size(); ++i) {
+        scored.push_back({logits[i] * inv_temp, static_cast<int64_t>(i)});
+    }
+
+    std::sort(scored.begin(), scored.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+    if (sampling->top_k > 0 && static_cast<size_t>(sampling->top_k) < scored.size()) {
+        scored.resize(static_cast<size_t>(sampling->top_k));
+    }
+
+    float max_logit = -std::numeric_limits<float>::infinity();
+    for (const auto &it : scored) max_logit = std::max(max_logit, it.first);
+
+    std::vector<float> probs(scored.size(), 0.0f);
+    float sum = 0.0f;
+    for (size_t i = 0; i < scored.size(); ++i) {
+        probs[i] = std::exp(scored[i].first - max_logit);
+        sum += probs[i];
+    }
+
+    for (float &p : probs) p /= std::max(1e-12f, sum);
+
+    if (sampling->top_p > 0.0f && sampling->top_p < 1.0f) {
+        float cumulative = 0.0f;
+        size_t cutoff = probs.size();
+        for (size_t i = 0; i < probs.size(); ++i) {
+            cumulative += probs[i];
+            if (cumulative >= sampling->top_p) {
+                cutoff = i + 1;
+                break;
+            }
+        }
+        if (cutoff < probs.size()) {
+            scored.resize(cutoff);
+            probs.resize(cutoff);
+            float renorm = 0.0f;
+            for (float p : probs) renorm += p;
+            for (float &p : probs) p /= std::max(1e-12f, renorm);
+        }
+    }
+
+    std::discrete_distribution<size_t> dist(probs.begin(), probs.end());
+    const size_t pick = dist(_rng);
+    return scored[pick].second;
+}
+
 int64_t Qwen2Model::infer(int64_t *token_ids, size_t ntoken) {
     core::context().setDevice(_device_type, _device_id);
     auto &runtime = core::context().runtime();
@@ -252,6 +320,76 @@ int64_t Qwen2Model::infer(int64_t *token_ids, size_t ntoken) {
     _current_pos += ntoken;
 
     return next_token;
+}
+
+int64_t Qwen2Model::infer_with_sampling(int64_t *token_ids, size_t ntoken, const LlaisysSamplingConfig *sampling) {
+    core::context().setDevice(_device_type, _device_id);
+    auto &runtime = core::context().runtime();
+
+    // reuse infer graph by running to logits path again: keep aligned with infer implementation
+    auto input_tokens = Tensor::create({ntoken}, LLAISYS_DTYPE_I64, _device_type, _device_id);
+    input_tokens->load(token_ids);
+
+    auto pos_ids = Tensor::create({ntoken}, LLAISYS_DTYPE_I64, _device_type, _device_id);
+    std::vector<int64_t> pos_data(ntoken);
+    for(size_t i=0; i<ntoken; ++i) pos_data[i] = _current_pos + i;
+    pos_ids->load(pos_data.data());
+
+    auto x = Tensor::create({ntoken, _meta.hs}, _meta.dtype, _device_type, _device_id);
+    ops::embedding(x, input_tokens, _in_embed);
+
+    for (size_t i = 0; i < _meta.nlayer; ++i) {
+        auto residual = x;
+        auto x_norm = Tensor::create({ntoken, _meta.hs}, _meta.dtype, _device_type, _device_id);
+        ops::rms_norm(x_norm, x, _layers_input_norm[i], _meta.epsilon);
+        auto q_flat = Tensor::create({ntoken, _meta.nh * _meta.dh}, _meta.dtype, _device_type, _device_id);
+        auto k_flat = Tensor::create({ntoken, _meta.nkvh * _meta.dh}, _meta.dtype, _device_type, _device_id);
+        auto v_flat = Tensor::create({ntoken, _meta.nkvh * _meta.dh}, _meta.dtype, _device_type, _device_id);
+        ops::linear(q_flat, x_norm, _layers_q_w[i], _layers_q_b[i]);
+        ops::linear(k_flat, x_norm, _layers_k_w[i], _layers_k_b[i]);
+        ops::linear(v_flat, x_norm, _layers_v_w[i], _layers_v_b[i]);
+        auto q = q_flat->view({ntoken, _meta.nh, _meta.dh});
+        auto k = k_flat->view({ntoken, _meta.nkvh, _meta.dh});
+        auto v = v_flat->view({ntoken, _meta.nkvh, _meta.dh});
+        ops::rope(q, q, pos_ids, _meta.theta);
+        ops::rope(k, k, pos_ids, _meta.theta);
+        auto k_cache_slot = _k_cache[i]->slice(0, _current_pos, _current_pos + ntoken);
+        auto v_cache_slot = _v_cache[i]->slice(0, _current_pos, _current_pos + ntoken);
+        runtime.api()->memcpy_sync(k_cache_slot->data(), k->data(), k->numel() * k->elementSize(), LLAISYS_MEMCPY_D2D);
+        runtime.api()->memcpy_sync(v_cache_slot->data(), v->data(), v->numel() * v->elementSize(), LLAISYS_MEMCPY_D2D);
+        auto k_full = _k_cache[i]->slice(0, 0, _current_pos + ntoken);
+        auto v_full = _v_cache[i]->slice(0, 0, _current_pos + ntoken);
+        auto attn_out = Tensor::create({ntoken, _meta.nh, _meta.dh}, _meta.dtype, _device_type, _device_id);
+        const float scale = 1.0f / std::sqrt(static_cast<float>(_meta.dh));
+        ops::self_attention(attn_out, q, k_full, v_full, scale);
+        auto attn_out_flat = attn_out->view({ntoken, _meta.nh * _meta.dh});
+        auto h_attn = Tensor::create({ntoken, _meta.hs}, _meta.dtype, _device_type, _device_id);
+        ops::linear(h_attn, attn_out_flat, _layers_o_w[i], nullptr);
+        ops::add(x, residual, h_attn);
+        residual = x;
+        ops::rms_norm(x_norm, x, _layers_post_norm[i], _meta.epsilon);
+        auto gate = Tensor::create({ntoken, _meta.di}, _meta.dtype, _device_type, _device_id);
+        auto up = Tensor::create({ntoken, _meta.di}, _meta.dtype, _device_type, _device_id);
+        ops::linear(gate, x_norm, _layers_gate_w[i], nullptr);
+        ops::linear(up, x_norm, _layers_up_w[i], nullptr);
+        auto mlp_act = Tensor::create({ntoken, _meta.di}, _meta.dtype, _device_type, _device_id);
+        ops::swiglu(mlp_act, gate, up);
+        auto h_mlp = Tensor::create({ntoken, _meta.hs}, _meta.dtype, _device_type, _device_id);
+        ops::linear(h_mlp, mlp_act, _layers_down_w[i], nullptr);
+        ops::add(x, residual, h_mlp);
+    }
+
+    auto x_final = Tensor::create({ntoken, _meta.hs}, _meta.dtype, _device_type, _device_id);
+    ops::rms_norm(x_final, x, _out_norm_w, _meta.epsilon);
+    auto x_last = x_final->slice(0, ntoken - 1, ntoken);
+    auto logits_t = Tensor::create({1, _meta.voc}, _meta.dtype, _device_type, _device_id);
+    ops::linear(logits_t, x_last, _out_embed, nullptr);
+
+    std::vector<float> logits_host(_meta.voc);
+    runtime.api()->memcpy_sync(logits_host.data(), logits_t->data(), logits_host.size() * sizeof(float), LLAISYS_MEMCPY_D2H);
+
+    _current_pos += ntoken;
+    return sample_from_logits(logits_host, sampling);
 }
 
 } // namespace

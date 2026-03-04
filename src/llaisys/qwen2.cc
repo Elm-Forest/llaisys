@@ -29,4 +29,12 @@ __C {
     int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken) {
         return model->model->infer(token_ids, ntoken);
     }
+
+    int64_t llaisysQwen2ModelInferEx(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken, const struct LlaisysSamplingConfig *sampling) {
+        return model->model->infer_with_sampling(token_ids, ntoken, sampling);
+    }
+
+    void llaisysQwen2ModelReset(struct LlaisysQwen2Model * model) {
+        model->model->reset();
+    }
 }

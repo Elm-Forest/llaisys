@@ -41,6 +41,15 @@ class LlaisysQwen2Weights(Structure):
 class LlaisysQwen2Model(Structure):
     pass
 
+
+class LlaisysSamplingConfig(Structure):
+    _fields_ = [
+        ("temperature", c_float),
+        ("top_k", c_int),
+        ("top_p", c_float),
+        ("seed", ctypes.c_uint64),
+    ]
+
 llaisysQwen2Model_t = POINTER(LlaisysQwen2Model)
 
 def load_models(lib):
@@ -55,3 +64,9 @@ def load_models(lib):
 
     lib.llaisysQwen2ModelInfer.argtypes = [llaisysQwen2Model_t, POINTER(c_int64), c_size_t]
     lib.llaisysQwen2ModelInfer.restype = c_int64
+
+    lib.llaisysQwen2ModelInferEx.argtypes = [llaisysQwen2Model_t, POINTER(c_int64), c_size_t, POINTER(LlaisysSamplingConfig)]
+    lib.llaisysQwen2ModelInferEx.restype = c_int64
+
+    lib.llaisysQwen2ModelReset.argtypes = [llaisysQwen2Model_t]
+    lib.llaisysQwen2ModelReset.restype = None
